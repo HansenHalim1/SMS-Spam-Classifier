@@ -9,7 +9,7 @@ FASTAPI_URL = os.getenv("FASTAPI_URL", "http://localhost:8000")
 st.set_page_config(page_title="SMS Spam Classifier", page_icon="📨", layout="centered")
 
 st.title("📨 SMS Spam Classifier")
-st.caption("Kaggle-trained • CPU-only • FastAPI + Streamlit")
+st.caption("Kaggle (EN + ID SMS) • 5-fold tuned • CPU-only • FastAPI + Streamlit")
 
 with st.sidebar:
     st.subheader("Settings")
