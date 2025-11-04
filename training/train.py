@@ -1,112 +1,239 @@
+from __future__ import annotations
+
 import argparse
 import json
 import re
 import time
 from pathlib import Path
+from typing import List
 
+import numpy as np
 import pandas as pd
 from kaggle import api as kaggle_api
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 CLEAN_URL = re.compile(r"https?://\S+")
 CLEAN_NUM = re.compile(r"\b\d+\b")
+CLEAN_CURRENCY = re.compile(r"[$€£¥]+")
+CLEAN_MULTI_SPACE = re.compile(r"\s+")
+
+DEFAULT_DATASETS = [
+    "tinu10kumar/sms-spam-dataset",
+    "gevabriel/indonesian-sms-spam",
+]
 
 
-def clean_text(s: str) -> str:
-    s = s or ""
-    s = s.lower()
-    s = CLEAN_URL.sub(" url ", s)
-    s = CLEAN_NUM.sub(" num ", s)
-    return s.strip()
+def clean_text(text: str) -> str:
+    text = text or ""
+    text = text.lower()
+    text = CLEAN_URL.sub(" url ", text)
+    text = CLEAN_CURRENCY.sub(" currency ", text)
+    text = CLEAN_NUM.sub(" num ", text)
+    text = CLEAN_MULTI_SPACE.sub(" ", text)
+    return text.strip()
 
 
-def load_kaggle_dataset(slug: str, outdir: Path) -> Path:
-    outdir.mkdir(parents=True, exist_ok=True)
-    kaggle_api.dataset_download_files(slug, path=str(outdir), unzip=True, quiet=False)
+def dataset_cache_dir(base_dir: Path, slug: str) -> Path:
+    safe_name = slug.replace("/", "__")
+    target = base_dir / safe_name
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
+
+def download_dataset(slug: str, target_dir: Path) -> None:
+    kaggle_api.dataset_download_files(slug, path=str(target_dir), unzip=True, quiet=False)
+
+
+def discover_data_file(dataset_dir: Path) -> Path:
     candidates = [
-        outdir / "spam.csv",
-        outdir / "SMSSpamCollection.csv",
-        outdir / "SMSSpamCollection",
+        path
+        for path in dataset_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".csv", ".tsv", ".txt"}
     ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    for path in outdir.glob("**/*"):
-        if path.suffix.lower() in {".csv", ".tsv", ""}:
-            return path
-
-    raise FileNotFoundError("Could not locate dataset file after download.")
+    if not candidates:
+        raise FileNotFoundError(f"No tabular file (.csv/.tsv/.txt) found in {dataset_dir}")
+    # Prefer top-level CSVs first
+    candidates.sort(key=lambda p: (len(p.parts), p.name))
+    return candidates[0]
 
 
-def read_dataset(path: Path) -> pd.DataFrame:
-    try:
-        df = pd.read_csv(path, encoding="latin1")
-    except Exception:
+def read_table(path: Path) -> pd.DataFrame:
+    attempts: List[Tuple[str, Dict[str, object]]] = [
+        ("utf-8", {"sep": ","}),
+        ("utf-8", {"sep": None, "engine": "python"}),
+        ("latin1", {"sep": ","}),
+        ("latin1", {"sep": None, "engine": "python"}),
+    ]
+    for encoding, kwargs in attempts:
         try:
-            df = pd.read_csv(path, encoding="utf-8")
+            return pd.read_csv(path, encoding=encoding, **kwargs)
         except Exception:
-            df = pd.read_csv(path, sep="\t", header=None, names=["label", "text"])
+            continue
+    raise ValueError(f"Unable to parse {path}")
 
-    cols = [c.lower() for c in df.columns]
+
+def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [str(col).strip().lower() for col in df.columns]
     df.columns = cols
 
-    if "v1" in df.columns and "v2" in df.columns:
-        df = df.rename(columns={"v1": "label", "v2": "text"})
+    label_candidates = [
+        col
+        for col in cols
+        if any(token in col for token in ["label", "class", "category", "status", "spam"])
+    ]
+    text_candidates = [
+        col
+        for col in cols
+        if any(token in col for token in ["text", "message", "sms", "content", "body"])
+    ]
 
-    if "label" not in df.columns or "text" not in df.columns:
-        df = df.rename(columns={cols[0]: "label", cols[1]: "text"})
+    label_col = label_candidates[0] if label_candidates else cols[0]
+    text_col = text_candidates[0] if text_candidates else (cols[1] if len(cols) > 1 else cols[0])
 
-    df = df[["label", "text"]].dropna()
-    df["label"] = df["label"].map(lambda x: "spam" if str(x).strip().lower() == "spam" else "ham")
+    slim = df[[label_col, text_col]].rename(columns={label_col: "label", text_col: "text"})
+    return slim.dropna(subset=["text"])
+
+
+def load_dataset(slug: str, base_dir: Path) -> pd.DataFrame:
+    print(f"Downloading dataset: {slug}")
+    target_dir = dataset_cache_dir(base_dir, slug)
+    download_dataset(slug, target_dir)
+    data_path = discover_data_file(target_dir)
+    df_raw = read_table(data_path)
+    df = normalise_columns(df_raw)
+    df["label"] = df["label"].map(lambda val: "spam" if "spam" in str(val).lower() else "ham")
+    df["text"] = df["text"].astype(str)
+    df = df.dropna(subset=["label", "text"])
+    df["source"] = slug
+    print(f"Loaded {df.shape[0]} rows from {slug}")
     return df
 
 
-def vectorize_and_train(df: pd.DataFrame, ngram=(1, 2), C=2.0, random_state=42):
-    X = df["text"].map(clean_text).tolist()
-    y = (df["label"] == "spam").astype(int).values
+def vectorize_and_train(
+    df: pd.DataFrame,
+    vectorizer_params: dict,
+    C: float,
+    random_state: int = 42,
+):
+    texts = df["text"].map(clean_text).to_numpy()
+    labels = (df["label"] == "spam").astype(int).to_numpy()
 
     vectorizer = TfidfVectorizer(
-        ngram_range=ngram,
-        min_df=2,
-        max_df=0.98,
+        ngram_range=vectorizer_params["ngram_range"],
+        min_df=vectorizer_params["min_df"],
+        max_df=vectorizer_params["max_df"],
+        max_features=vectorizer_params["max_features"],
         sublinear_tf=True,
         norm="l2",
+        strip_accents="unicode",
+        lowercase=True,
+        token_pattern=r"[a-z']+",
     )
-    X_vec = vectorizer.fit_transform(X)
 
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X_vec,
-        y,
+    X_train_texts, X_valid_texts, y_train, y_valid = train_test_split(
+        texts,
+        labels,
         test_size=0.2,
         random_state=random_state,
-        stratify=y,
+        stratify=labels,
     )
 
+    X_train_vec = vectorizer.fit_transform(X_train_texts)
+    X_valid_vec = vectorizer.transform(X_valid_texts)
+
     model = LogisticRegression(
-        max_iter=200,
+        max_iter=400,
         C=C,
         solver="liblinear",
+        class_weight="balanced",
         random_state=random_state,
     )
     start = time.time()
-    model.fit(X_train, y_train)
-    train_time = time.time() - start
+    model.fit(X_train_vec, y_train)
+    runtime = time.time() - start
 
-    y_pred = model.predict(X_valid)
+    y_pred = model.predict(X_valid_vec)
     f1 = f1_score(y_valid, y_pred)
-    print(f"Train time: {train_time:.2f}s")
-    print("F1:", f1)
+    print(f"Holdout F1: {f1:.4f} (training {runtime:.2f}s)")
     print(classification_report(y_valid, y_pred, digits=4))
 
     return vectorizer, model, f1
 
 
-def save_artifacts(vectorizer: TfidfVectorizer, model: LogisticRegression, outdir: Path, version="v1.0.0") -> None:
+def cross_validate(
+    texts: np.ndarray,
+    labels: np.ndarray,
+    vectorizer_params: dict,
+    C: float,
+    random_state: int,
+) -> float:
+    splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    scores: List[float] = []
+
+    for train_idx, valid_idx in splitter.split(texts, labels):
+        vect = TfidfVectorizer(
+            ngram_range=vectorizer_params["ngram_range"],
+            min_df=vectorizer_params["min_df"],
+            max_df=vectorizer_params["max_df"],
+            max_features=vectorizer_params["max_features"],
+            sublinear_tf=True,
+            norm="l2",
+            strip_accents="unicode",
+            lowercase=True,
+            token_pattern=r"[a-z']+",
+        )
+
+        X_train = vect.fit_transform(texts[train_idx])
+        X_valid = vect.transform(texts[valid_idx])
+
+        clf = LogisticRegression(
+            max_iter=400,
+            C=C,
+            solver="liblinear",
+            class_weight="balanced",
+            random_state=random_state,
+        )
+        clf.fit(X_train, labels[train_idx])
+        scores.append(f1_score(labels[valid_idx], clf.predict(X_valid)))
+
+    return float(np.mean(scores))
+
+
+def hyperparameter_search(df: pd.DataFrame, random_state: int) -> tuple[dict, float, float]:
+    texts = df["text"].map(clean_text).to_numpy()
+    labels = (df["label"] == "spam").astype(int).to_numpy()
+
+    param_grid = [
+        {"ngram_range": (1, 2), "min_df": 1, "max_df": 0.98, "max_features": 20000, "C": 1.5},
+        {"ngram_range": (1, 3), "min_df": 1, "max_df": 0.97, "max_features": 30000, "C": 2.0},
+        {"ngram_range": (1, 4), "min_df": 1, "max_df": 0.96, "max_features": 32000, "C": 2.5},
+        {"ngram_range": (1, 4), "min_df": 2, "max_df": 0.95, "max_features": 28000, "C": 3.0},
+    ]
+
+    best_score = -1.0
+    best_params: dict | None = None
+
+    for params in param_grid:
+        score = cross_validate(texts, labels, params, params["C"], random_state)
+        print(
+            f"CV F1={score:.4f} | ngram={params['ngram_range']} min_df={params['min_df']} "
+            f"max_df={params['max_df']} max_features={params['max_features']} C={params['C']}"
+        )
+        if score > best_score:
+            best_score = score
+            best_params = params.copy()
+
+    if best_params is None:
+        raise RuntimeError("Hyperparameter search failed to evaluate any configuration.")
+
+    best_C = best_params.pop("C")
+    return best_params, best_C, best_score
+
+
+def save_artifacts(vectorizer: TfidfVectorizer, model: LogisticRegression, outdir: Path, version="v1.1.0") -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     vocab = {token: int(idx) for token, idx in vectorizer.vocabulary_.items()}
@@ -131,7 +258,15 @@ def save_artifacts(vectorizer: TfidfVectorizer, model: LogisticRegression, outdi
             "max_df": float(vectorizer.max_df)
             if hasattr(vectorizer.max_df, "__float__")
             else vectorizer.max_df,
+            "max_features": vectorizer.max_features,
             "lowercase": True,
+            "strip_accents": "unicode",
+            "token_pattern": vectorizer.token_pattern,
+        },
+        "training_meta": {
+            "class_weight": "balanced",
+            "solver": "liblinear",
+            "max_iter": model.max_iter,
         },
     }
     (outdir / "model.pkl").write_text(json.dumps(model_json))
@@ -147,32 +282,55 @@ def save_artifacts(vectorizer: TfidfVectorizer, model: LogisticRegression, outdi
     (outdir / "label_map.json").write_text(json.dumps(label_map, indent=2))
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="uciml/sms-spam-collection-dataset")
+    parser.add_argument(
+        "--dataset",
+        dest="datasets",
+        action="append",
+        help="Kaggle dataset slug to include (repeat flag to merge multiple datasets).",
+    )
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--outdir", type=Path, default=Path("../artifacts"))
     args = parser.parse_args()
 
+    datasets = args.datasets if args.datasets else DEFAULT_DATASETS
+    print("Datasets:")
+    for slug in datasets:
+        print(f" - {slug}")
+
     data_dir = Path("./data")
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_path = load_kaggle_dataset(args.dataset, data_dir)
-    df = read_dataset(dataset_path)
-    print("Loaded:", df.shape)
+    frames: List[pd.DataFrame] = []
+    for slug in datasets:
+        df = load_dataset(slug, data_dir)
+        frames.append(df)
 
-    _, _, f1_baseline = vectorize_and_train(df, ngram=(1, 1), C=1.0, random_state=args.random_state)
-    vectorizer, model, f1_improved = vectorize_and_train(
-        df,
-        ngram=(1, 2),
-        C=2.0,
+    dataset = pd.concat(frames, ignore_index=True)
+    dataset = dataset.drop_duplicates(subset="text")
+    print(f"Combined dataset shape: {dataset.shape}")
+
+    best_vec_params, best_C, cv_score = hyperparameter_search(dataset, args.random_state)
+    print(
+        "Selected params -> "
+        f"ngram_range={best_vec_params['ngram_range']}, "
+        f"min_df={best_vec_params['min_df']}, max_df={best_vec_params['max_df']}, "
+        f"max_features={best_vec_params['max_features']}, C={best_C} "
+        f"(CV F1={cv_score:.4f})"
+    )
+
+    vectorizer, model, holdout_f1 = vectorize_and_train(
+        dataset,
+        vectorizer_params=best_vec_params,
+        C=best_C,
         random_state=args.random_state,
     )
 
-    print(f"Baseline F1 ~ {f1_baseline:.3f} -> Improved F1 {f1_improved:.3f}")
+    print(f"Final holdout F1: {holdout_f1:.4f}")
 
-    save_artifacts(vectorizer, model, args.outdir, version="v1.0.0")
+    save_artifacts(vectorizer, model, args.outdir, version="v1.1.0")
 
 
 if __name__ == "__main__":
