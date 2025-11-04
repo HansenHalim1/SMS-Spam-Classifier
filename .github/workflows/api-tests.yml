@@ -1,0 +1,43 @@
+name: API tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      api:
+        image: python:3.11-slim
+        ports:
+          - 8000:8000
+        options: >-
+          --health-cmd="curl -f http://localhost:8000/health || exit 1"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
+        env:
+          ALLOWED_ORIGINS: "http://localhost:8501,http://localhost:3000,https://*.hf.space"
+        volumes:
+          - ${{ github.workspace }}:/app
+        command: >
+          bash -lc "
+          pip install --no-cache-dir -r /app/backend/requirements.txt &&
+          python -c 'import uvicorn' &&
+          uvicorn backend.main:app --host 0.0.0.0 --port 8000
+          "
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test deps
+        run: pip install pytest==8.3.3 requests==2.32.3
+      - name: Wait for API
+        run: |
+          for i in {1..30}; do
+            if curl -sf http://localhost:8000/health >/dev/null; then exit 0; fi
+            sleep 2
+          done
+          echo "API never became healthy"
+          exit 1
+      - name: Run tests
+        run: pytest -q

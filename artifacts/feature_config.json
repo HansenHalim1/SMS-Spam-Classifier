@@ -1,0 +1,5 @@
+{
+  "token_pattern": "[a-zA-Z']+",
+  "lowercase": true,
+  "strip": true
+}
