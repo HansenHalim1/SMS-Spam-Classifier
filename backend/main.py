@@ -35,6 +35,8 @@ with open(ART_DIR / "label_map.json", "r", encoding="utf-8") as fh:
 with open(ART_DIR / "model.pkl", "r", encoding="utf-8") as fh:
     MODEL = json.load(fh)
 
+THRESHOLD = float(MODEL.get("threshold", 0.5))
+
 MODEL_VERSION = MODEL.get("version", "v0")
 
 VOCAB: Dict[str, int] = {token: int(idx) for token, idx in MODEL["vocabulary"].items()}
@@ -125,7 +127,7 @@ def predict(payload: PredictIn):
 
     start = time.time()
     prob_spam, tokens = predict_proba(payload.text)
-    label_idx = 1 if prob_spam >= 0.5 else 0
+    label_idx = 1 if prob_spam >= THRESHOLD else 0
     label = LABEL_MAP[label_idx]
     latency = int((time.time() - start) * 1000)
 
@@ -146,5 +148,5 @@ def predict(payload: PredictIn):
         "score": round(float(score), 4),
         "latency_ms": latency,
         "model_version": MODEL_VERSION,
-        "debug": {"top_features": contributions},
+        "debug": {"top_features": contributions, "threshold": THRESHOLD},
     }

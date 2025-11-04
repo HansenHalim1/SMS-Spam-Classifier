@@ -25,6 +25,40 @@ DEFAULT_DATASETS = [
     "gevabriel/indonesian-sms-spam",
 ]
 
+SPAM_TOKENS = {
+    "spam",
+    "spm",
+    "junk",
+    "promo",
+    "iklan",
+    "penipuan",
+    "fraud",
+    "hoax",
+    "phishing",
+    "1",
+    "y",
+    "yes",
+    "ya",
+}
+HAM_TOKENS = {
+    "ham",
+    "legit",
+    "normal",
+    "bukan spam",
+    "bukanspam",
+    "non spam",
+    "nonspam",
+    "not spam",
+    "tidak spam",
+    "tidakspam",
+    "0",
+    "n",
+    "no",
+    "tidak",
+    "false",
+}
+NEGATION_TOKENS = {"not", "non", "no", "bukan", "tidak"}
+
 
 def clean_text(text: str) -> str:
     text = text or ""
@@ -55,13 +89,12 @@ def discover_data_file(dataset_dir: Path) -> Path:
     ]
     if not candidates:
         raise FileNotFoundError(f"No tabular file (.csv/.tsv/.txt) found in {dataset_dir}")
-    # Prefer top-level CSVs first
     candidates.sort(key=lambda p: (len(p.parts), p.name))
     return candidates[0]
 
 
 def read_table(path: Path) -> pd.DataFrame:
-    attempts: List[Tuple[str, Dict[str, object]]] = [
+    attempts = [
         ("utf-8", {"sep": ","}),
         ("utf-8", {"sep": None, "engine": "python"}),
         ("latin1", {"sep": ","}),
@@ -73,6 +106,24 @@ def read_table(path: Path) -> pd.DataFrame:
         except Exception:
             continue
     raise ValueError(f"Unable to parse {path}")
+
+
+def map_label(raw_value: object) -> str:
+    value = str(raw_value or "").strip().lower()
+    value_no_space = value.replace(" ", "")
+    if not value:
+        return "ham"
+    if value in HAM_TOKENS or value_no_space in HAM_TOKENS:
+        return "ham"
+    if value in SPAM_TOKENS or value_no_space in SPAM_TOKENS:
+        return "spam"
+    if value.isdigit():
+        return "spam" if value in {"1", "2", "3"} else "ham"
+    if any(token in value for token in NEGATION_TOKENS) and "spam" in value:
+        return "ham"
+    if any(keyword in value for keyword in ["spam", "promo", "iklan", "penipuan", "fraud", "promo"]):
+        return "spam"
+    return "ham"
 
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -94,7 +145,9 @@ def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     text_col = text_candidates[0] if text_candidates else (cols[1] if len(cols) > 1 else cols[0])
 
     slim = df[[label_col, text_col]].rename(columns={label_col: "label", text_col: "text"})
-    return slim.dropna(subset=["text"])
+    slim["label"] = slim["label"].map(map_label)
+    slim["text"] = slim["text"].astype(str)
+    return slim.dropna(subset=["label", "text"])
 
 
 def load_dataset(slug: str, base_dir: Path) -> pd.DataFrame:
@@ -104,9 +157,6 @@ def load_dataset(slug: str, base_dir: Path) -> pd.DataFrame:
     data_path = discover_data_file(target_dir)
     df_raw = read_table(data_path)
     df = normalise_columns(df_raw)
-    df["label"] = df["label"].map(lambda val: "spam" if "spam" in str(val).lower() else "ham")
-    df["text"] = df["text"].astype(str)
-    df = df.dropna(subset=["label", "text"])
     df["source"] = slug
     print(f"Loaded {df.shape[0]} rows from {slug}")
     return df
@@ -155,12 +205,25 @@ def vectorize_and_train(
     model.fit(X_train_vec, y_train)
     runtime = time.time() - start
 
-    y_pred = model.predict(X_valid_vec)
-    f1 = f1_score(y_valid, y_pred)
-    print(f"Holdout F1: {f1:.4f} (training {runtime:.2f}s)")
-    print(classification_report(y_valid, y_pred, digits=4))
+    y_pred_default = model.predict(X_valid_vec)
+    f1_default = f1_score(y_valid, y_pred_default)
+    print(f"Holdout F1 @0.50: {f1_default:.4f} (training {runtime:.2f}s)")
 
-    return vectorizer, model, f1
+    probas = model.predict_proba(X_valid_vec)[:, 1]
+    threshold_grid = np.linspace(0.2, 0.8, 61)
+    best_threshold = 0.5
+    best_f1 = f1_default
+    for threshold in threshold_grid:
+        preds = (probas >= threshold).astype(int)
+        score = f1_score(y_valid, preds)
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = float(threshold)
+
+    print(f"Best threshold {best_threshold:.2f} -> F1 {best_f1:.4f}")
+    print(classification_report(y_valid, (probas >= best_threshold).astype(int), digits=4))
+
+    return vectorizer, model, best_threshold, best_f1
 
 
 def cross_validate(
@@ -233,7 +296,13 @@ def hyperparameter_search(df: pd.DataFrame, random_state: int) -> tuple[dict, fl
     return best_params, best_C, best_score
 
 
-def save_artifacts(vectorizer: TfidfVectorizer, model: LogisticRegression, outdir: Path, version="v1.1.0") -> None:
+def save_artifacts(
+    vectorizer: TfidfVectorizer,
+    model: LogisticRegression,
+    threshold: float,
+    outdir: Path,
+    version: str = "v1.1.0",
+) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     vocab = {token: int(idx) for token, idx in vectorizer.vocabulary_.items()}
@@ -244,6 +313,7 @@ def save_artifacts(vectorizer: TfidfVectorizer, model: LogisticRegression, outdi
     model_json = {
         "model_type": "logreg",
         "version": version,
+        "threshold": threshold,
         "classes": ["ham", "spam"],
         "coef": coef,
         "intercept": intercept,
@@ -321,16 +391,16 @@ def main() -> None:
         f"(CV F1={cv_score:.4f})"
     )
 
-    vectorizer, model, holdout_f1 = vectorize_and_train(
+    vectorizer, model, threshold, holdout_f1 = vectorize_and_train(
         dataset,
         vectorizer_params=best_vec_params,
         C=best_C,
         random_state=args.random_state,
     )
 
-    print(f"Final holdout F1: {holdout_f1:.4f}")
+    print(f"Final holdout F1 @best threshold: {holdout_f1:.4f}")
 
-    save_artifacts(vectorizer, model, args.outdir, version="v1.1.0")
+    save_artifacts(vectorizer, model, threshold, args.outdir, version="v1.1.0")
 
 
 if __name__ == "__main__":
