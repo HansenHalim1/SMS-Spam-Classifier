@@ -36,6 +36,24 @@ with open(ART_DIR / "model.pkl", "r", encoding="utf-8") as fh:
     MODEL = json.load(fh)
 
 THRESHOLD = float(MODEL.get("threshold", 0.5))
+SAFE_OVERRIDE_WINDOW = float(MODEL.get("safe_override_window", 0.15))
+RISK_TOKENS = set(
+    MODEL.get("risk_tokens", [
+        "free",
+        "win",
+        "prize",
+        "cash",
+        "voucher",
+        "promo",
+        "offer",
+        "selamat",
+        "hadiah",
+        "klik",
+        "url",
+        "http",
+        "claim",
+    ])
+)
 
 MODEL_VERSION = MODEL.get("version", "v0")
 
@@ -128,6 +146,11 @@ def predict(payload: PredictIn):
     start = time.time()
     prob_spam, tokens = predict_proba(payload.text)
     label_idx = 1 if prob_spam >= THRESHOLD else 0
+    override_reason = None
+    if label_idx == 1 and prob_spam < THRESHOLD + SAFE_OVERRIDE_WINDOW:
+        if not any(tok in RISK_TOKENS for tok in tokens):
+            label_idx = 0
+            override_reason = "soft_ham_override"
     label = LABEL_MAP[label_idx]
     latency = int((time.time() - start) * 1000)
 
@@ -143,10 +166,15 @@ def predict(payload: PredictIn):
 
     score = prob_spam if label_idx == 1 else 1 - prob_spam
 
+    debug_payload: Dict[str, Any] = {"top_features": contributions, "threshold": THRESHOLD}
+    if override_reason:
+        debug_payload["override"] = override_reason
+        debug_payload["raw_probability"] = round(float(prob_spam), 4)
+
     return {
         "prediction": label,
         "score": round(float(score), 4),
         "latency_ms": latency,
         "model_version": MODEL_VERSION,
-        "debug": {"top_features": contributions, "threshold": THRESHOLD},
+        "debug": debug_payload,
     }

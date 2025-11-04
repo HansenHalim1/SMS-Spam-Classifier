@@ -12,7 +12,7 @@ import pandas as pd
 from kaggle import api as kaggle_api
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import classification_report, f1_score, precision_recall_fscore_support
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 CLEAN_URL = re.compile(r"https?://\S+")
@@ -210,17 +210,34 @@ def vectorize_and_train(
     print(f"Holdout F1 @0.50: {f1_default:.4f} (training {runtime:.2f}s)")
 
     probas = model.predict_proba(X_valid_vec)[:, 1]
-    threshold_grid = np.linspace(0.2, 0.8, 61)
-    best_threshold = 0.5
+    threshold_grid = np.linspace(0.1, 0.9, 81)
+    best_f1_threshold = 0.5
     best_f1 = f1_default
+    precision_target = 0.98
+    high_precision_choice: tuple[float, float, float, float] | None = None
+
     for threshold in threshold_grid:
         preds = (probas >= threshold).astype(int)
-        score = f1_score(y_valid, preds)
-        if score > best_f1:
-            best_f1 = score
-            best_threshold = float(threshold)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y_valid, preds, pos_label=1, average="binary", zero_division=0
+        )
+        if f1 > best_f1:
+            best_f1 = f1
+            best_f1_threshold = float(threshold)
+        if precision >= precision_target:
+            if high_precision_choice is None or precision > high_precision_choice[1]:
+                high_precision_choice = (float(threshold), precision, recall, f1)
 
-    print(f"Best threshold {best_threshold:.2f} -> F1 {best_f1:.4f}")
+    if high_precision_choice:
+        best_threshold = high_precision_choice[0]
+        print(
+            f"Selected high-precision threshold {best_threshold:.2f} (precision={high_precision_choice[1]:.3f}, "
+            f"recall={high_precision_choice[2]:.3f}, f1={high_precision_choice[3]:.4f})"
+        )
+    else:
+        best_threshold = best_f1_threshold
+        print(f"Selected F1-optimal threshold {best_threshold:.2f} (F1={best_f1:.4f})")
+
     print(classification_report(y_valid, (probas >= best_threshold).astype(int), digits=4))
 
     return vectorizer, model, best_threshold, best_f1

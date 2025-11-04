@@ -14,3 +14,5 @@
 - **Provenance**: Original UCI repository (via Kaggle mirror).
 
 - **Modeling**: TF-IDF + Logistic Regression with 5-fold stratified hyperparameter search (balanced class weights).
+
+- **Thresholding**: Logistic regression threshold tuned for ≥0.98 spam precision when possible.
